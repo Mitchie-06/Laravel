@@ -1,99 +1,61 @@
 <?php
-use Illuminate\Database\Migrations\Migration;
-use Illuminate\Support\Facades\DB;
-return new class extends Migration
-{
-    public function up(): void
-    {
-        if (DB::getDriverName() !== 'pgsql') {
-            return;
-        }
-        DB::unprepared(<<<'SQL'-- Classroom demonstration: anonymous clients can manage fictional students.
-ALTER TABLE public.students ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON public.students FROM anon, authenticated;
-GRANT SELECT, DELETE ON public.students TO anon;
-GRANT INSERT (student_number, first_name, last_name, email, course, year_level),
-    UPDATE (student_number, first_name, last_name, email, course, year_level)
-    ON public.students TO anon;
-REVOKE ALL ON SEQUENCE public.students_id_seq FROM anon, authenticated;
-GRANT USAGE, SELECT ON SEQUENCE public.students_id_seq TO anon;
-CREATE POLICY student_demo_read ON public.students FOR SELECT TO anon
-    USING (true);
-CREATE POLICY student_demo_insert ON public.students FOR INSERT TO anon
-    WITH CHECK (true);
-CREATE POLICY student_demo_update ON public.students FOR UPDATE TO anon
-    USING (true)
-    WITH CHECK (true);
-CREATE POLICY student_demo_delete ON public.students FOR DELETE TO anon
-    USING (true);
-CREATE FUNCTION public.student_app_validate_row() RETURNS trigger
-LANGUAGE plpgsql SET search_path = '' AS $$
-BEGIN
-    NEW.student_number := btrim(NEW.student_number);
-    NEW.first_name := btrim(NEW.first_name);
-    NEW.last_name := btrim(NEW.last_name);
-    NEW.email := btrim(NEW.email);
-    NEW.course := btrim(NEW.course);
-    IF NEW.student_number IS NULL OR char_length(NEW.student_number) NOT BETWEEN 1 AND 30
-       OR NEW.first_name IS NULL OR char_length(NEW.first_name) NOT BETWEEN 1 AND 100
-       OR NEW.last_name IS NULL OR char_length(NEW.last_name) NOT BETWEEN 1 AND 100
-       OR NEW.course IS NULL OR char_length(NEW.course) NOT BETWEEN 1 AND 120
-       OR NEW.email IS NULL OR char_length(NEW.email) > 255
-       OR NEW.email !~ '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$'
-       OR NEW.year_level IS NULL OR NEW.year_level NOT BETWEEN 1 AND 6 THEN
-        RAISE EXCEPTION 'Student fields are invalid. Check required fields, email and year level.' USING ERRCOD
-          E = '23514';
-    END IF;
-    IF TG_OP = 'INSERT' THEN
-        NEW.created_at := COALESCE(NEW.created_at, timezone('utc', now()));
-    ELSE
-       NEW.created_at := OLD.created_at;
-    END IF;
-    NEW.updated_at := timezone('utc', clock_timestamp());
-    RETURN NEW;
-END;
-$$;
-REVOKE ALL ON FUNCTION public.student_app_validate_row() FROM PUBLIC, anon, authenticated;
-CREATE TRIGGER student_app_validate_before_write BEFORE INSERT OR UPDATE ON public.students
-    FOR EACH ROW EXECUTE FUNCTION public.student_app_validate_row();
-CREATE FUNCTION public.student_app_search(search_term text DEFAULT '', offset_rows integer DEFAULT 0, page_size
-   integer DEFAULT 21)
-RETURNS SETOF public.students LANGUAGE sql STABLE SECURITY INVOKER SET search_path = '' AS $$
-    SELECT * FROM public.students
-    WHERE COALESCE(search_term, '') = ''
-       OR strpos(lower(student_number), lower(search_term)) > 0
-       OR strpos(lower(first_name || ' ' || last_name), lower(search_term)) > 0
-       OR strpos(lower(email), lower(search_term)) > 0
-       OR strpos(lower(course), lower(search_term)) > 0
-    ORDER BY last_name, first_name, id
-    LIMIT greatest(1, least(COALESCE(page_size, 21), 101)) OFFSET greatest(0, COALESCE(offset_rows, 0));
-$$;
-REVOKE ALL ON FUNCTION public.student_app_search(text, integer, integer) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION public.student_app_search(text, integer, integer) TO anon;
-NOTIFY pgrst, 'reload schema';
-SQL);
-    }
-    public function down(): void
-    {
-        if (DB::getDriverName() !== 'pgsql') {
-            return;
-        }
-        DB::unprepared(<<<'SQL'
-DROP POLICY IF EXISTS student_demo_read ON public.students;
-DROP POLICY IF EXISTS student_demo_insert ON public.students;
-DROP POLICY IF EXISTS student_demo_update ON public.students;
-DROP POLICY IF EXISTS student_demo_delete ON public.students;
-DROP TRIGGER IF EXISTS student_app_validate_before_write ON public.students;
-DROP FUNCTION IF EXISTS public.student_app_search(text, integer, integer);
-DROP FUNCTION IF EXISTS public.student_app_validate_row();
-REVOKE ALL ON public.students FROM anon;
-REVOKE INSERT (student_number, first_name, last_name, email, course, year_level), UPDATE (student_number, first
-  _name, last_name, email, course, year_level) ON public.students FROM anon;
-REVOKE USAGE, SELECT ON SEQUENCE public.students_id_seq FROM anon, authenticated;
-NOTIFY pgrst, 'reload schema';
-SQL);
-    }
+require __DIR__.'/../vendor/autoload.php';
+$app = require __DIR__.'/../bootstrap/app.php';
+$app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+$db = Illuminate\Support\Facades\DB::connection();
+if ($db->getDriverName() !== 'pgsql') { throw new RuntimeException('Use the configured Supabase PostgreSQL conn
+  ection.'); }
+$assert = function (bool $ok, string $message): void {
+    if (!$ok) { throw new RuntimeException($message); }
+    echo "PASS: $message\n";
 };
-
-
-
+$expectError = function (callable $operation, string $code) use ($db, $assert): void {
+    $db->statement('SAVEPOINT expected_error');
+    $caught = null;
+    try { $operation(); } catch (Throwable $e) { $caught = $e; }
+    $db->statement('ROLLBACK TO SAVEPOINT expected_error');
+    $db->statement('RELEASE SAVEPOINT expected_error');
+    $assert($caught !== null && (string) $caught->getCode() === $code, "Database rejects request with SQLSTATE 
+      $code");
+};
+$db->beginTransaction();
+try {
+    $db->statement('SET LOCAL ROLE anon');
+    foreach (['users', 'sessions', 'password_reset_tokens'] as $table) {
+        $p = $db->selectOne("SELECT has_table_privilege(current_user, ?, 'SELECT') AS allowed", ["public.$table
+          "]);
+        $assert(!$p->allowed, "Anonymous role cannot read $table");
+    }
+    $number = 'VERIFY-'.bin2hex(random_bytes(5));
+    $email = strtolower($number).'@example.test';
+    $row = $db->selectOne('INSERT INTO public.students (student_number, first_name, last_name, email, course, y
+      ear_level) VALUES (?, ?, ?, ?, ?, ?) RETURNING *', [$number, '  Transaction  ', 'Demo', $email, 'Test Cou
+      rse', 2]);
+    $assert($row->first_name === 'Transaction' && $row->created_at && $row->updated_at, 'Anonymous insert trims
+       fields and fills timestamps');
+    $found = $db->select('SELECT * FROM public.student_app_search(?, 0, 21)', [$number]);
+    $assert(count($found) === 1 && $found[0]->id === $row->id, 'Search returns the saved record');
+    $expectError(fn () => $db->statement('UPDATE public.students SET email = ? WHERE id = ?', ['invalid-email',
+       $row->id]), '23514');
+    $expectError(fn () => $db->statement('UPDATE public.students SET year_level = 7 WHERE id = ?', [$row->id]),
+       '23514');
+    $expectError(fn () => $db->statement('UPDATE public.students SET id = id WHERE id = ?', [$row->id]), '42501
+      ');
+    $expectError(fn () => $db->statement('INSERT INTO public.students (student_number, first_name, last_name, e
+      mail, course, year_level) VALUES (?, ?, ?, ?, ?, ?)', [$number, 'Duplicate', 'Demo', 'duplicate.'.$email,
+       'Test', 1]), '23505');
+    $expectError(fn () => $db->statement('INSERT INTO public.students (student_number, first_name, last_name, e
+      mail, course, year_level) VALUES (?, ?, ?, ?, ?, ?)', [$number.'X', 'Duplicate', 'Demo', $email, 'Test', 
+      1]), '23505');
+    $updated = $db->selectOne('UPDATE public.students SET course = ? WHERE id = ? RETURNING *', ['Updated Cours
+      e', $row->id]);
+    $assert($updated->course === 'Updated Course' && $updated->created_at === $row->created_at, 'Anonymous upda
+      te works and preserves creation time');
+    $assert($db->delete('DELETE FROM public.students WHERE id = ?', [$row->id]) === 1, 'Anonymous delete works'
+      );
+    $assert(count($db->select('SELECT * FROM public.students WHERE id = ?', [$row->id])) === 0, 'Deleted fixtur
+      e is absent');
+} finally {
+    $db->rollBack();
+}
+echo "All checks passed. Transaction rolled back; existing records were untouched.\n";
